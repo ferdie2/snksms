@@ -1,173 +1,217 @@
-import requests, time, os, re
+import os
+import requests
+import time
+from yt_dlp import YoutubeDL
 
-TOKEN = os.environ.get("TOKEN")  # Ambil token dari Railway ENV
-URL = f'https://api.telegram.org/bot{TOKEN}'
-FILE_URL = f'https://api.telegram.org/file/bot{TOKEN}'
-DATA_DIR = 'data'
-os.makedirs(DATA_DIR, exist_ok=True)
+BOT_TOKEN = "8115892574:AAHhCuq04Hcy0OoaXqkDmuqOQtf5UBZkl9w"
+API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/"
+offset = None
+state = {}
 
-offset = 0
-user_state = {}
+def send_message(chat_id, text):
+    resp = requests.post(API_URL + "sendMessage", data={"chat_id": chat_id, "text": text})
+    return resp.json().get("result", {}).get("message_id")
 
-COMMANDS = [
-    {"command": "reset", "description": "Reset all your data"},
-    {"command": "status", "description": "Show current file & mode"}
-]
-requests.post(f"{URL}/setMyCommands", json={"commands": COMMANDS})
+def send_video_or_document(chat_id, file_path):
+    size = os.path.getsize(file_path)
+    with open(file_path, "rb") as f:
+        if file_path.endswith(".mp4") and size < 50 * 1024 * 1024:
+            requests.post(API_URL + "sendVideo", data={"chat_id": chat_id}, files={"video": f})
+        else:
+            requests.post(API_URL + "sendDocument", data={"chat_id": chat_id}, files={"document": f})
+
+def edit_message(chat_id, message_id, new_text):
+    requests.post(API_URL + "editMessageText", data={
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": new_text
+    })
 
 def get_updates():
     global offset
-    resp = requests.get(f'{URL}/getUpdates?timeout=100&offset={offset+1}')
-    return resp.json().get('result', [])
+    response = requests.get(API_URL + "getUpdates", params={"offset": offset, "timeout": 100})
+    return response.json().get("result", [])
 
-def send_message(chat_id, text, reply_markup=None):
-    data = {'chat_id': chat_id, 'text': text}
-    if reply_markup:
-        data['reply_markup'] = reply_markup
-    requests.post(f'{URL}/sendMessage', json=data)
+def get_available_resolutions(url):
+    ydl_opts = {"quiet": True, "skip_download": True}
+    resolutions = {}
+    with YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+        for f in info.get("formats", []):
+            if f.get("vcodec") != "none" and f.get("height") and f.get("ext") == "mp4":
+                label = f"{f['height']}p"
+                resolutions[label] = f["format_id"]
+    return dict(sorted(resolutions.items(), key=lambda x: int(x[0][:-1])))
 
-def send_code(chat_id, text):
-    code = f"```c\n{text}\n```"
-    requests.post(f"{URL}/sendMessage", data={
-        "chat_id": chat_id,
-        "text": code,
-        "parse_mode": "Markdown"
-    })
+def download_with_aria2(url, chat_id=None, message_id=None, output_format="mp4", mp3_bitrate="192", format_id=None):
+    outtmpl = "%(title).80s.%(ext)s"
+    progress = {"percent": 0}
 
-def download_file(file_id, save_path):
-    r = requests.get(f'{URL}/getFile?file_id={file_id}').json()
-    file_path = r['result']['file_path']
-    file_url = f"{FILE_URL}/{file_path}"
-    file_data = requests.get(file_url).content
-    with open(save_path, 'wb') as f:
-        f.write(file_data)
+    def hook(d):
+        if d['status'] == 'downloading':
+            p = d.get('_percent_str', '').strip()
+            if p.endswith('%'):
+                try:
+                    percent = int(float(p.strip('%')))
+                    if percent != progress["percent"]:
+                        progress["percent"] = percent
+                        bar = f"[{'█'*int(percent/10)}{' '*(10-int(percent/10))}] {percent}%"
+                        if chat_id and message_id:
+                            edit_message(chat_id, message_id, f"📥 Sedang mengunduh...\n{bar}")
+                except: pass
 
-def extract_matches(lines, keywords, exact=False):
-    result = []
-    for kw in keywords:
-        matches = []
-        for i, line in enumerate(lines):
-            match = re.search(rf'\b{re.escape(kw)}\b', line, re.I) if exact else kw.lower() in line.lower()
-            if match:
-                if i > 0 and re.search(r'(RVA|Offset|VA|0x)', lines[i-1]):
-                    matches.append(lines[i-1])
-                matches.append(line)
-                if i + 1 < len(lines) and "{" in lines[i+1]:
-                    matches.append(lines[i+1])
-        if matches:
-            result.append(f"\n🔑 {kw}")
-            for j, line in enumerate(matches):
-                prefix = "🧬 " if re.search(r'(RVA|Offset|VA|0x)', line) else "> "
-                result.append(f"{prefix}{line.strip()}")
-                if (j + 1) % 2 == 0:
-                    result.append("")
-    return "\n".join(result)
-
-def handle_document(chat_id, file_id, filename):
-    save_path = f"{DATA_DIR}/{chat_id}_{filename}"
-    download_file(file_id, save_path)
-    user_state[chat_id] = {
-        'file': save_path,
-        'mode': None,
-        'keywords': []
+    ydl_opts = {
+        "outtmpl": outtmpl,
+        "quiet": True,
+        "external_downloader": "aria2c",
+        "external_downloader_args": ["-x", "16", "-k", "1M"],
+        "progress_hooks": [hook],
+        "noplaylist": True,
+        "merge_output_format": "mp4"
     }
-    btn = {
-        "keyboard": [[{"text": "📍 Manual"}], [{"text": "⚙️ Config"}]],
-        "resize_keyboard": True,
-        "one_time_keyboard": True
-    }
-    send_message(chat_id, "📦 File received. Choose search mode:", reply_markup=btn)
 
-def handle_message(chat_id, text):
-    state = user_state.get(chat_id)
-
-    if text.startswith("/reset"):
-        files = [f for f in os.listdir(DATA_DIR) if f.startswith(str(chat_id))]
-        for f in files:
-            os.remove(os.path.join(DATA_DIR, f))
-        user_state.pop(chat_id, None)
-        send_message(chat_id, "🔄 Your data has been reset.")
-
-    elif text.startswith("/status"):
-        if state and 'file' in state:
-            msg = f"📄 File: {os.path.basename(state['file'])}\n🔍 Mode: {state.get('mode', 'Not selected')}"
-        else:
-            msg = "ℹ️ No file uploaded yet."
-        send_message(chat_id, msg)
-
-    elif text == "📍 Manual":
-        if not state or 'file' not in state or not os.path.exists(state['file']):
-            send_message(chat_id, "❗ Please upload a .cs file first.")
-            return
-        user_state[chat_id]['mode'] = 'manual'
-        user_state[chat_id]['keywords'] = []
-        send_message(chat_id, "✅ Manual mode. Send keywords one by one. Use /done when finished.")
-
-    elif text == "⚙️ Config":
-        if not state or 'file' not in state or not os.path.exists(state['file']):
-            send_message(chat_id, "❗ Please upload a .cs file first.")
-            return
-        user_state[chat_id]['mode'] = 'config'
-        config_path = f"{DATA_DIR}/{chat_id}_config.txt"
-        open(config_path, 'w').write("get_gold\nget_level")
-        with open(config_path, 'rb') as f:
-            requests.post(f"{URL}/sendDocument", data={"chat_id": chat_id}, files={"document": f})
-        send_message(chat_id, "🛠️ Edit & re-name to config.txt & re-upload")
-
-    elif text == "/done" and state and state.get('mode') == 'manual':
-        lines = open(state['file'], encoding='utf-8', errors='ignore').readlines()
-        result = extract_matches(lines, state['keywords'], exact=False)
-        send_code(chat_id, result or "❌ Nothing found.")
-
-    elif state and state.get('mode') == 'manual':
-        user_state[chat_id]['keywords'].append(text.strip())
-        send_message(chat_id, f"➕ Keyword added: `{text.strip()}`")
-
-    elif state and 'file' in state:
-        send_message(chat_id, "📄 Using previously uploaded file. Choose a mode.")
-
+    if output_format == "mp3":
+        ydl_opts["format"] = "bestaudio"
+        ydl_opts["postprocessors"] = [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": mp3_bitrate,
+        }]
     else:
-        send_message(chat_id, "❗ Please upload a .cs file first.")
+        if format_id and "+bestaudio" not in format_id:
+            ydl_opts["format"] = f"{format_id}+bestaudio[ext=m4a]/best"
+        else:
+            ydl_opts["format"] = format_id or "best"
 
-def handle_config_upload(chat_id, file_id):
-    config_path = f"{DATA_DIR}/{chat_id}_config.txt"
-    download_file(file_id, file_path=config_path)
-    keywords = [x.strip() for x in open(config_path, encoding='utf-8').readlines() if x.strip()]
-    cs_path = user_state[chat_id]['file']
-    lines = open(cs_path, encoding='utf-8', errors='ignore').readlines()
-    result = extract_matches(lines, keywords, exact=True)
-    send_code(chat_id, result or "❌ Nothing found.")
+    with YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        filename = ydl.prepare_filename(info)
+        if output_format == "mp3":
+            filename = os.path.splitext(filename)[0] + ".mp3"
+    return filename
 
-print("🤖 Bot running...")
-while True:
-    updates = get_updates()
-    for u in updates:
-        offset = u['update_id']
-        msg = u.get('message', {})
-        chat_id = msg.get('chat', {}).get('id')
+def main():
+    global offset
+    print("🤖 Bot aktif...")
 
-        if 'document' in msg:
-            fname = msg['document']['file_name']
-            fid = msg['document']['file_id']
-            if fname.endswith(".cs"):
-                handle_document(chat_id, fid, fname)
-            elif fname == "config.txt":
-                handle_config_upload(chat_id, fid)
+    while True:
+        updates = get_updates()
+        for update in updates:
+            offset = update["update_id"] + 1
 
-        elif 'text' in msg:
-            text = msg['text']
-            if text.strip() == '.' and 'reply_to_message' in msg:
-                replied = msg['reply_to_message']
-                if 'text' in replied:
-                    save_path = f"{DATA_DIR}/{chat_id}_saved_result.txt"
-                    with open(save_path, 'w', encoding='utf-8') as f:
-                        f.write(replied['text'])
-                    with open(save_path, 'rb') as f:
-                        requests.post(f"{URL}/sendDocument", data={"chat_id": chat_id}, files={"document": f})
-                    send_message(chat_id, "✅ Result saved & sent to you.")
-                else:
-                    send_message(chat_id, "⚠️ No text found in the replied message.")
-            else:
-                handle_message(chat_id, text)
+            if "message" in update:
+                msg = update["message"]
+                chat_id = msg["chat"]["id"]
+                text = msg.get("text", "").strip()
+                step = state.get(chat_id, {}).get("step")
 
-    time.sleep(1)
+                if text == "/start":
+                    send_message(chat_id,
+                        "👋 Welcome to *TSS Downloader Bot*\n"
+                        "🔹 Download YouTube & TikTok dengan pilihan resolusi & format.\n"
+                        "🚀 Booster Aria2c + progress bar realtime.\n"
+                        "📣 Feedback: @YourUsernameHere\n\n"
+                        "▶️ Commands:\n"
+                        "/yt - YouTube\n"
+                        "/tt - TikTok"
+                    )
+                    state[chat_id] = {}
+
+                elif text == "/tt":
+                    state[chat_id] = {"step": "awaiting_tiktok_url"}
+                    send_message(chat_id, "📹 Kirim link TikTok:")
+
+                elif step == "awaiting_tiktok_url":
+                    if "tiktok.com" not in text:
+                        send_message(chat_id, "❌ Link TikTok tidak valid.")
+                        continue
+                    msg_id = send_message(chat_id, "📥 Mengunduh TikTok...")
+                    try:
+                        filepath = download_with_aria2(text, chat_id, msg_id)
+                        send_video_or_document(chat_id, filepath)
+                        os.remove(filepath)
+                    except Exception as e:
+                        send_message(chat_id, f"❌ Error: {e}")
+                    state[chat_id] = {}
+
+                elif text == "/yt":
+                    state[chat_id] = {"step": "awaiting_youtube_url"}
+                    send_message(chat_id, "🔗 Kirim link YouTube:")
+
+                elif step == "awaiting_youtube_url":
+                    state[chat_id]["url"] = text
+                    state[chat_id]["step"] = "awaiting_format_choice"
+                    requests.post(API_URL + "sendMessage", json={
+                        "chat_id": chat_id,
+                        "text": "🎬 Pilih format download:",
+                        "reply_markup": {
+                            "inline_keyboard": [
+                                [{"text": "🎥 MP4 (Video)", "callback_data": "format_mp4"}],
+                                [{"text": "🎧 MP3 (Audio Only)", "callback_data": "format_mp3"}]
+                            ]
+                        }
+                    })
+
+            elif "callback_query" in update:
+                cb = update["callback_query"]
+                data = cb["data"]
+                chat_id = cb["message"]["chat"]["id"]
+                msg_id = cb["message"]["message_id"]
+                url = state.get(chat_id, {}).get("url")
+
+                if data == "format_mp3":
+                    send_message(chat_id, "🎧 Mengunduh MP3...")
+                    try:
+                        filepath = download_with_aria2(url, chat_id, msg_id, output_format="mp3")
+                        send_video_or_document(chat_id, filepath)
+                        os.remove(filepath)
+                    except Exception as e:
+                        send_message(chat_id, f"❌ Error: {e}")
+                    state[chat_id] = {}
+
+                elif data == "format_mp4":
+                    try:
+                        resolutions = get_available_resolutions(url)
+                        if not resolutions:
+                            send_message(chat_id, "❌ Tidak ada resolusi ditemukan.")
+                            state[chat_id] = {}
+                            continue
+                        state[chat_id]["resolutions"] = resolutions
+
+                        buttons = []
+                        temp = []
+                        for label, fmt_id in resolutions.items():
+                            temp.append({"text": label, "callback_data": f"res_{fmt_id}"})
+                            if len(temp) == 3:
+                                buttons.append(temp)
+                                temp = []
+                        if temp:
+                            buttons.append(temp)
+
+                        requests.post(API_URL + "sendMessage", json={
+                            "chat_id": chat_id,
+                            "text": "📺 Pilih resolusi:",
+                            "reply_markup": {
+                                "inline_keyboard": buttons
+                            }
+                        })
+
+                    except Exception as e:
+                        send_message(chat_id, f"❌ Error ambil resolusi: {e}")
+                        state[chat_id] = {}
+
+                elif data.startswith("res_"):
+                    format_id = data[4:]
+                    send_message(chat_id, "⬇️ Mengunduh resolusi yang dipilih...")
+                    try:
+                        filepath = download_with_aria2(state[chat_id]["url"], chat_id, msg_id, format_id=format_id)
+                        send_video_or_document(chat_id, filepath)
+                        os.remove(filepath)
+                    except Exception as e:
+                        send_message(chat_id, f"❌ Error: {e}")
+                    state[chat_id] = {}
+
+        time.sleep(1)
+
+if __name__ == "__main__":
+    main()
